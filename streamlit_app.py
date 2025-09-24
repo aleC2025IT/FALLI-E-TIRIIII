@@ -1,449 +1,387 @@
-# streamlit_app.py
-# -------------------------------------------------------------
-# Serie A: Probable Lineups + Player Probabilities (Fouls≥2, SOT≥1)
-# Data sources: API-FOOTBALL (fixtures, players stats),
-#               Gazzetta/Fantacalcio/Sky (probabili formazioni via HTML),
-#               Open‑Meteo (match weather by venue coords)
-# -------------------------------------------------------------
-# ⚠️ Read me:
-# 1) Set an environment variable API_FOOTBALL_KEY with your key (https://dashboard.api-football.com)
-# 2) Run:  streamlit run streamlit_app.py
-# 3) If scraping of "probabili formazioni" fails (HTML changes), paste lineups manually in the fallback textbox.
-# -------------------------------------------------------------
+# ================================
+# Serie A Probabilities – 1-file app
+# Fouls ≥2  |  Shots on Target ≥1
+# ================================
+# Niente librerie extra: solo Python + Streamlit!
+# - Dati partite/giocatori: API-FOOTBALL (serve API_FOOTBALL_KEY)
+# - Meteo stadio: Open-Meteo (gratis, no key)
+#
+# Come si usa: vedi istruzioni a fine file (sezione "ISTRUZIONI").
+# ================================
 
-import os
-import re
-import math
-import time
-import json
-import html
-import textwrap
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple, Optional
-
-import requests
-from bs4 import BeautifulSoup
-import pandas as pd
-import numpy as np
+import os, json, math, time
+from datetime import datetime, timezone, timedelta
+from urllib.request import Request, urlopen
+from urllib.parse import urlencode
+import ssl
 import streamlit as st
 
-# ----------------------- CONFIG -----------------------
-LEAGUE_ID = 135        # Serie A in API‑FOOTBALL (commonly 135)
-SEASON = 2025          # 2025/26
-HEADERS = {
-    "x-rapidapi-host": "v3.football.api-sports.io",
-    "x-rapidapi-key": os.getenv("API_FOOTBALL_KEY", "")
-}
-API_BASE = "https://v3.football.api-sports.io"
+# --------- CONFIG BASE ----------
+LEAGUE_ID = 135   # Serie A
+SEASON    = 2025  # Stagione 2025/26
+API_BASE  = "https://v3.football.api-sports.io"
+# Usa prima la variabile d'ambiente/Secrets; se manca, usa la tua chiave fornita
+API_KEY   = os.getenv("API_FOOTBALL_KEY", "605521ceda7756cc4cdb65f41e369e0d")
 
-OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
-OPEN_METEO_PARAMS = {
-    "hourly": [
-        "temperature_2m",
-        "precipitation",
-        "windspeed_10m",
-        "cloudcover",
-    ],
-    "timezone": "Europe/Rome"
-}
+# Disabilita verifiche SSL su alcuni ambienti (più tollerante)
+ssl_ctx = ssl.create_default_context()
+ssl_ctx.check_hostname = False
+ssl_ctx.verify_mode = ssl.CERT_NONE
 
-# ----------------------- UTILS -----------------------
-@st.cache_data(ttl=1800, show_spinner=False)
-def api_get(path: str, params: dict) -> dict:
-    url = f"{API_BASE}/{path}"
-    r = requests.get(url, headers=HEADERS, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_current_round() -> str:
-    data = api_get("fixtures/rounds", {"league": LEAGUE_ID, "season": SEASON, "current": "true"})
-    rounds = data.get("response", [])
-    return rounds[0] if rounds else "Regular Season - 1"
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_round_fixtures(round_name: str) -> pd.DataFrame:
-    data = api_get("fixtures", {"league": LEAGUE_ID, "season": SEASON, "round": round_name})
-    rows = []
-    for fx in data.get("response", []):
-        fixture = fx.get("fixture", {})
-        teams = fx.get("teams", {})
-        venue = fixture.get("venue", {})
-        rows.append({
-            "fixture_id": fixture.get("id"),
-            "datetime": fixture.get("date"),
-            "referee": fixture.get("referee"),
-            "status": fixture.get("status", {}).get("short"),
-            "home_id": teams.get("home", {}).get("id"),
-            "home": teams.get("home", {}).get("name"),
-            "away_id": teams.get("away", {}).get("id"),
-            "away": teams.get("away", {}).get("name"),
-            "venue_id": venue.get("id"),
-            "venue": venue.get("name"),
-            "city": venue.get("city"),
-        })
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df["datetime"] = pd.to_datetime(df["datetime"])  # UTC
-        df["kickoff_local"] = df["datetime"].dt.tz_convert("Europe/Rome")
-    return df
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_venue_coords(venue_id: int) -> Tuple[Optional[float], Optional[float]]:
-    # API‑FOOTBALL venues endpoint sometimes available via fixtures/venues; fallback none
+# ------------- UTILS ------------
+def http_get_json(url: str, headers: dict | None = None, params: dict | None = None) -> dict:
+    if params:
+        qs = urlencode({k: v for k, v in params.items() if v is not None})
+        if "?" in url:
+            url = url + "&" + qs
+        else:
+            url = url + "?" + qs
+    req = Request(url, headers=headers or {})
+    with urlopen(req, context=ssl_ctx, timeout=30) as resp:
+        data = resp.read().decode("utf-8", errors="ignore")
     try:
-        data = api_get("venues", {"id": venue_id})
-        resp = data.get("response", [])
-        if resp:
-            v = resp[0]
-            return v.get("latitude"), v.get("longitude")
-    except Exception:
-        pass
-    return None, None
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_weather(lat: float, lon: float, when_utc: pd.Timestamp) -> dict:
-    # Fetch hourly weather +/- 12h around kickoff and pick nearest hour
-    params = {
-        **OPEN_METEO_PARAMS,
-        "latitude": lat,
-        "longitude": lon,
-        "start_hour": (when_utc - pd.Timedelta(hours=12)).strftime("%Y-%m-%dT%H:00"),
-        "end_hour": (when_utc + pd.Timedelta(hours=12)).strftime("%Y-%m-%dT%H:00"),
-    }
-    # Open‑Meteo uses 'start_date/end_date' or 'hourly' window; we'll just query a day window
-    params = {
-        **OPEN_METEO_PARAMS,
-        "latitude": lat,
-        "longitude": lon,
-        "start_date": (when_utc - pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-        "end_date": (when_utc + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-    }
-    r = requests.get(OPEN_METEO_BASE, params=params, timeout=30)
-    r.raise_for_status()
-    js = r.json()
-    hourly = js.get("hourly", {})
-    times = pd.to_datetime(hourly.get("time", []))
-    if len(times) == 0:
+        return json.loads(data)
+    except:
         return {}
-    idx = int(np.argmin(np.abs(times.tz_localize("Europe/Rome").tz_convert("UTC") - when_utc)))
+
+def api_get(path: str, params: dict) -> dict:
+    headers = {
+        "x-rapidapi-host": "v3.football.api-sports.io",
+        "x-rapidapi-key": API_KEY
+    }
+    return http_get_json(f"{API_BASE}/{path}", headers=headers, params=params)
+
+def parse_iso_utc(s: str) -> datetime:
+    # API restituisce ISO con Z oppure offset; normalizziamo
+    # Esempi: "2025-09-27T18:45:00+00:00" oppure "2025-09-27T18:45:00Z"
+    if s.endswith("Z"):
+        s = s.replace("Z", "+00:00")
+    return datetime.fromisoformat(s).astimezone(timezone.utc)
+
+def round_name_current() -> str:
+    js = api_get("fixtures/rounds", {"league": LEAGUE_ID, "season": SEASON, "current": "true"})
+    arr = js.get("response", [])
+    return arr[0] if arr else "Regular Season - 1"
+
+def fixtures_for_round(round_name: str) -> list[dict]:
+    js = api_get("fixtures", {"league": LEAGUE_ID, "season": SEASON, "round": round_name})
+    out = []
+    for fx in js.get("response", []):
+        fixture = fx.get("fixture", {})
+        teams   = fx.get("teams", {})
+        venue   = fixture.get("venue", {})
+        out.append({
+            "fixture_id": fixture.get("id"),
+            "date_utc": parse_iso_utc(fixture.get("date")),
+            "status": fixture.get("status", {}).get("short"),
+            "referee": fixture.get("referee"),
+            "home_id": teams.get("home", {}).get("id"),
+            "home":    teams.get("home", {}).get("name"),
+            "away_id": teams.get("away", {}).get("id"),
+            "away":    teams.get("away", {}).get("name"),
+            "venue_id": venue.get("id"),
+            "venue":   venue.get("name"),
+            "city":    venue.get("city"),
+        })
+    return out
+
+def venue_coords(venue_id: int) -> tuple[float|None, float|None]:
+    js = api_get("venues", {"id": venue_id})
+    resp = js.get("response", [])
+    if not resp: return (None, None)
+    v = resp[0]
+    return (v.get("latitude"), v.get("longitude"))
+
+def open_meteo_at(lat: float, lon: float, ko_utc: datetime) -> dict:
+    # Prendiamo 48h attorno al kickoff e scegliamo l'ora più vicina
+    start = (ko_utc - timedelta(days=1)).strftime("%Y-%m-%d")
+    end   = (ko_utc + timedelta(days=1)).strftime("%Y-%m-%d")
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "temperature_2m,precipitation,windspeed_10m,cloudcover",
+        "timezone": "Europe/Rome",
+        "start_date": start,
+        "end_date": end,
+    }
+    js = http_get_json("https://api.open-meteo.com/v1/forecast", params=params)
+    hourly = js.get("hourly", {})
+    times = hourly.get("time", [])
+    if not times: return {}
+    # trova indice con tempo più vicino a ko_utc
+    best_i, best_diff = 0, 10**9
+    for i, t in enumerate(times):
+        try:
+            dt_local = datetime.fromisoformat(t)  # naive Europe/Rome
+            dt_utc = dt_local - timedelta(hours=2)  # approx offset
+            diff = abs((dt_utc - ko_utc).total_seconds())
+            if diff < best_diff:
+                best_diff, best_i = diff, i
+        except:
+            pass
     def pick(key):
         arr = hourly.get(key, [])
-        return arr[idx] if idx < len(arr) else None
+        return arr[best_i] if best_i < len(arr) else None
     return {
         "temperature_2m": pick("temperature_2m"),
-        "precipitation": pick("precipitation"),
-        "windspeed_10m": pick("windspeed_10m"),
-        "cloudcover": pick("cloudcover"),
-        "time": times[idx].isoformat(),
+        "precipitation":  pick("precipitation"),
+        "windspeed_10m":  pick("windspeed_10m"),
+        "cloudcover":     pick("cloudcover"),
+        "time_local":     times[best_i] if best_i < len(times) else None
     }
 
-# ---------------- Probabili formazioni scrapers ----------------
-HEADERS_BROWSER = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
-
-@st.cache_data(ttl=900)
-def scrape_gazzetta() -> Dict[str, Dict[str, List[str]]]:
-    url = "https://www.gazzetta.it/Calcio/prob_form/"
-    r = requests.get(url, headers=HEADERS_BROWSER, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    # Heuristic parsing: find match blocks with team names and lists
-    blocks = soup.find_all(lambda tag: tag.name in ["section", "article", "div"] and "Probabili Formazioni" in tag.get_text(strip=True))
-    # Fallback: iterate all links to specific matches present in page
-    matches = {}
-    for a in soup.select("a[href*='/prob_form/']"):
-        href = a.get("href")
-        if not href or href.endswith("prob_form/"):
-            continue
-        try:
-            rr = requests.get(href, headers=HEADERS_BROWSER, timeout=30)
-            if rr.status_code != 200:
-                continue
-            ss = BeautifulSoup(rr.text, "html.parser")
-            title = ss.find("h1") or ss.find("title")
-            title_txt = title.get_text(strip=True) if title else ""
-            # Extract team names from URL or title
-            m = re.search(r"prob_form/([^/]+)/([^/?]+)", href)
-            if m:
-                t1, t2 = m.group(1), m.group(2)
-            else:
-                # fallback: split on ' - '
-                parts = re.split(r"[-–]", title_txt)
-                t1, t2 = (parts[0].strip(), parts[1].strip()) if len(parts) >= 2 else (None, None)
-            if not t1 or not t2:
-                continue
-            # starters lists often inside <ul> or <p> blocks labeled 'Probabile formazione'
-            text = ss.get_text("\n", strip=True)
-            # Very permissive regex to catch player names (capitalized words, apostrophes)
-            names = re.findall(r"[A-ZÀ-Ý][a-zà-ÿ'\-]+(?:\s[A-ZÀ-Ý][a-zà-ÿ'\-]+)?", text)
-            # This is too noisy; we cannot trust. Better to keep empty and let manual paste handle.
-            matches[f"{t1}|{t2}"] = {"home": [], "away": [], "bench_home": [], "bench_away": []}
-        except Exception:
-            continue
-    return matches
-
-@st.cache_data(ttl=900)
-def scrape_fantacalcio() -> Dict[str, Dict[str, List[str]]]:
-    url = "https://www.fantacalcio.it/probabili-formazioni-serie-a"
-    r = requests.get(url, headers=HEADERS_BROWSER, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    matches = {}
-    # The page lists tiles for each match that link to detail pages per team; we keep placeholder for now.
-    for tile in soup.select("a[href*='probabili-formazioni']"):
-        href = tile.get("href")
-        if not href or href.endswith("probabili-formazioni-serie-a"):
-            continue
-        # Not scraping deeply to avoid breaking; leave empty and rely on manual paste if needed.
-        # You can implement a tighter parser later when HTML is stable.
-        t1_t2 = tile.get_text(" ", strip=True)
-        if t1_t2 and "-" in t1_t2:
-            parts = [p.strip() for p in re.split(r"[-–]", t1_t2)][:2]
-            if len(parts) == 2:
-                matches[f"{parts[0]}|{parts[1]}"] = {"home": [], "away": [], "bench_home": [], "bench_away": []}
-    return matches
-
-# ---------------- Player statistics ----------------
-@st.cache_data(ttl=3600)
-def get_team_players_stats(team_id: int) -> pd.DataFrame:
-    # Pull players + season stats
-    data = api_get("players", {"team": team_id, "season": SEASON, "league": LEAGUE_ID})
-    rows = []
-    for item in data.get("response", []):
+def team_players_stats(team_id: int) -> list[dict]:
+    # Stats per giocatore per 90: falli commessi, tiri in porta, minuti
+    js = api_get("players", {"team": team_id, "season": SEASON, "league": LEAGUE_ID})
+    out = []
+    for item in js.get("response", []):
         player = item.get("player", {})
-        stats_list = item.get("statistics", [])
-        # pick Serie A stats
-        for stt in stats_list:
-            if stt.get("league", {}).get("id") != LEAGUE_ID:
+        for stt in item.get("statistics", []):
+            if stt.get("league", {}).get("id") != LEAGUE_ID: 
                 continue
-            games = stt.get("games", {})
-            offs = stt.get("offsides")
-            shots = stt.get("shots", {})
-            fouls = stt.get("fouls", {})
-            team = stt.get("team", {}).get("name")
+            games = stt.get("games", {}) or {}
+            shots = stt.get("shots", {}) or {}
+            fouls = stt.get("fouls", {}) or {}
             minutes = games.get("minutes") or 0
-            appear = games.get("appearences") or 0
-            # per90s
             min_safe = max(1, minutes)
             sot = shots.get("on") or 0
-            sh_total = shots.get("total") or 0
-            f_comm = fouls.get("committed") or 0
-            per90_sot = sot / (min_safe / 90)
-            per90_fouls = f_comm / (min_safe / 90)
-            rows.append({
+            fcomm = fouls.get("committed") or 0
+            out.append({
                 "player_id": player.get("id"),
-                "player": player.get("name"),
-                "team_id": team_id,
-                "team": team,
-                "position": games.get("position"),
-                "minutes": minutes,
-                "apps": appear,
-                "sot": sot,
-                "shots": sh_total,
-                "fouls_comm": f_comm,
-                "per90_sot": per90_sot,
-                "per90_fouls": per90_fouls,
+                "player":    player.get("name") or "",
+                "position":  games.get("position"),
+                "minutes":   minutes,
+                "per90_sot": (sot * 90.0) / min_safe,
+                "per90_fouls": (fcomm * 90.0) / min_safe
             })
-    return pd.DataFrame(rows)
+    return out
 
-@st.cache_data(ttl=3600)
-def get_team_defensive_tendencies(team_id: int) -> dict:
-    # Approx: opp SOT allowed per game, fouls drawn per game by opponents (hard to get)
-    # We'll derive from players stats aggregated after we pull all teams once; for now return neutral multipliers.
+def opponent_baseline_def(team_id: int) -> dict:
+    # placeholder medio (migliorabile in futuro)
     return {"opp_sot_allowed": 4.0, "opp_fouls_drawn": 12.0}
-
-# ---------------- Probability model ----------------
 
 def poisson_prob_ge_k(lam: float, k: int) -> float:
     lam = max(lam, 1e-9)
-    # P(X>=k) = 1 - sum_{i=0}^{k-1} e^-lam lam^i / i!
-    cum = sum(math.exp(-lam) * lam**i / math.factorial(i) for i in range(k))
-    return float(max(0.0, min(1.0, 1 - cum)))
+    s = 0.0
+    for i in range(k):
+        s += math.exp(-lam) * (lam**i) / math.factorial(i)
+    return max(0.0, min(1.0, 1.0 - s))
 
-
-def weather_adjustment(weather: dict) -> Tuple[float, float]:
-    """Returns (fouls_multiplier, sot_multiplier) based on weather"""
-    if not weather:
-        return 1.0, 1.0
-    precip = weather.get("precipitation") or 0
-    wind = weather.get("windspeed_10m") or 0
-    temp = weather.get("temperature_2m") or 18
-    fouls_mult = 1.0
-    sot_mult = 1.0
-    if precip >= 1.0:      # rain >=1 mm/h
+def weather_adjust(weather: dict) -> tuple[float, float]:
+    if not weather: return (1.0, 1.0)
+    precip = weather.get("precipitation") or 0.0
+    wind   = weather.get("windspeed_10m") or 0.0
+    temp   = weather.get("temperature_2m") or 18.0
+    fouls_mult, sot_mult = 1.0, 1.0
+    if precip >= 1.0:    # pioggia ↑ falli, ↓ SOT
         fouls_mult *= 1.05
-        sot_mult *= 0.93
-    if wind >= 25:         # strong wind km/h
-        sot_mult *= 0.9
+        sot_mult   *= 0.93
+    if wind >= 25:       # vento forte ↓ SOT
+        sot_mult   *= 0.90
     if temp <= 5:
         fouls_mult *= 1.03
-        sot_mult *= 0.95
+        sot_mult   *= 0.95
     if temp >= 30:
         fouls_mult *= 1.02
-        sot_mult *= 0.96
-    return fouls_mult, sot_mult
+        sot_mult   *= 0.96
+    return (fouls_mult, sot_mult)
 
+def best_name_match(name: str, stats: list[dict]) -> dict | None:
+    name_low = name.strip().lower()
+    for r in stats:
+        if (r.get("player") or "").strip().lower() == name_low:
+            return r
+    token = name_low.split()[-1] if name_low else ""
+    if token:
+        for r in stats:
+            pl = (r.get("player") or "").strip().lower()
+            if (" " + token) in (" " + pl) or pl.endswith(" " + token) or pl == token:
+                return r
+    return None
 
-def compute_probabilities(lineup: List[str], bench: List[str], team_stats: pd.DataFrame,
-                          opponent_def: dict, weather: dict) -> pd.DataFrame:
-    fouls_mult, sot_mult = weather_adjustment(weather)
-
-    def player_rate(name: str, col: str, default: float) -> float:
-        row = team_stats[team_stats["player"].str.fullmatch(name, case=False, na=False)]
-        if row.empty:
-            # attempt loose match by last name
-            token = name.split()[-1]
-            row = team_stats[team_stats["player"].str.contains(fr"\b{re.escape(token)}\b", case=False, na=False)]
-        if row.empty:
-            return default
-        return float(row.iloc[0][col])
-
-    rows = []
-    for name in lineup + bench:
-        starter = name in lineup
-        exp_minutes = 80 if starter else 30
-        lam_fouls = player_rate(name, "per90_fouls", 1.0) * (exp_minutes/90) * (opponent_def.get("opp_fouls_drawn", 12.0)/12.0) * fouls_mult
-        lam_sot   = player_rate(name, "per90_sot",   0.3) * (exp_minutes/90) * (opponent_def.get("opp_sot_allowed", 4.0)/4.0) * sot_mult
-        p_fouls2 = poisson_prob_ge_k(lam_fouls, 2)
-        p_sot1   = 1 - math.exp(-lam_sot)
-        rows.append({
-            "player": name,
-            "starter": starter,
-            "exp_min": exp_minutes,
-            "lambda_fouls": round(lam_fouls, 3),
-            "lambda_sot": round(lam_sot, 3),
-            "P(≥2 fouls)": round(p_fouls2, 3),
-            "P(≥1 SOT)": round(p_sot1, 3),
+def compute_for_squad(lineup: list[str], bench: list[str], stats: list[dict],
+                      opp_def: dict, weather: dict, min_starter: int, min_bench: int) -> list[dict]:
+    fmul, smul = weather_adjust(weather)
+    out = []
+    for name, is_starter in [(n, True) for n in lineup] + [(n, False) for n in bench]:
+        minutes = min_starter if is_starter else min_bench
+        rec = best_name_match(name, stats)
+        per90_fouls = (rec.get("per90_fouls") if rec else 1.0)
+        per90_sot   = (rec.get("per90_sot")   if rec else 0.30)
+        lam_f = per90_fouls * (minutes/90.0) * (opp_def.get("opp_fouls_drawn",12.0)/12.0) * fmul
+        lam_s = per90_sot   * (minutes/90.0) * (opp_def.get("opp_sot_allowed",4.0)/4.0) * smul
+        p_f2  = poisson_prob_ge_k(lam_f, 2)
+        p_s1  = 1.0 - math.exp(-max(lam_s, 1e-9))
+        out.append({
+            "player": name.strip(),
+            "starter": is_starter,
+            "exp_min": minutes,
+            "lambda_fouls": round(lam_f, 3),
+            "lambda_sot":   round(lam_s, 3),
+            "P(≥2 fouls)":  round(p_f2, 3),
+            "P(≥1 SOT)":    round(p_s1, 3),
         })
-    return pd.DataFrame(rows)
+    return out
 
-# --------------- UI -----------------
+# ------------- UI -------------
 st.set_page_config(page_title="Serie A • Probabili & Probabilities", layout="wide")
 st.title("Serie A • Probabili & Probabilities (fouls≥2, SOT≥1)")
 
-st.sidebar.header("Settings")
-api_key_ok = bool(HEADERS["x-rapidapi-key"]) and HEADERS["x-rapidapi-key"] != ""
-st.sidebar.write("API‑FOOTBALL key:", "✅" if api_key_ok else "❌ missing (set API_FOOTBALL_KEY)")
-source = st.sidebar.selectbox("Probabili formazioni source", ["Manual/Fallback", "Gazzetta", "Fantacalcio", "Sky Sport"], index=0)
-round_name = st.sidebar.text_input("Round (auto if blank)", value="")
-minutes_bench = st.sidebar.slider("Expected minutes for bench players", 10, 45, 30, 5)
-minutes_starter = st.sidebar.slider("Expected minutes for starters", 60, 95, 80, 5)
+st.sidebar.header("Impostazioni")
+key_ok = bool(API_KEY)
+st.sidebar.write("API-FOOTBALL key:", "✅" if key_ok else "❌ manca (vedi istruzioni sotto)")
 
-if round_name.strip() == "":
+min_starter = st.sidebar.slider("Minuti attesi TITOLARI", 60, 95, 80, 5)
+min_bench   = st.sidebar.slider("Minuti attesi PANCHINA", 10, 45, 30, 5)
+
+round_in = st.sidebar.text_input("Giornata (lascia vuoto per auto)", value="")
+if not key_ok:
+    st.warning("Manca la chiave API_FOOTBALL_KEY. Vai in 'Manage app' → 'Secrets' e aggiungila (istruzioni sotto).")
+
+# Scopri la giornata
+if not round_in:
     try:
-        round_name = get_current_round()
+        round_in = round_name_current()
     except Exception as e:
-        st.warning(f"Could not auto‑detect round: {e}")
-        round_name = "Regular Season - 1"
+        round_in = "Regular Season - 1"
+st.subheader(f"Giornata: {round_in}")
 
-st.subheader(f"Round: {round_name}")
-
+# Carica partite
+fixtures = []
 try:
-    fixtures_df = get_round_fixtures(round_name)
+    fixtures = fixtures_for_round(round_in)
 except Exception as e:
-    st.error(f"Error loading fixtures: {e}")
-    fixtures_df = pd.DataFrame()
+    st.error("Errore nel caricare le partite. Controlla la chiave API e riprova.")
 
-if fixtures_df.empty:
+if not fixtures:
     st.stop()
 
-# Allow user to pick matches
-match_labels = fixtures_df.apply(lambda r: f"{r['home']} vs {r['away']} — {r['kickoff_local']:%a %d %b %H:%M}", axis=1).tolist()
-selected = st.multiselect("Matches to analyze", match_labels, default=match_labels)
-sel_df = fixtures_df[fixtures_df.apply(lambda r: f"{r['home']} vs {r['away']} — {r['kickoff_local']:%a %d %b %H:%M}", axis=1).isin(selected)]
+# Elenco selezionabile
+labels = [f"{fx['home']} vs {fx['away']} — {fx['date_utc'].astimezone().strftime('%a %d %b %H:%M')}" for fx in fixtures]
+selected = st.multiselect("Scegli le partite da analizzare", labels, default=labels)
+selected_ids = {labels[i]: fixtures[i] for i in range(len(labels)) if labels[i] in selected}
 
-# Try to gather probabili formazioni
-pf_map: Dict[str, Dict[str, List[str]]] = {}
-if source == "Gazzetta":
-    pf_map = scrape_gazzetta()
-elif source == "Fantacalcio":
-    pf_map = scrape_fantacalcio()
-else:
-    pf_map = {}
-
-st.info("If lineups are empty or wrong, paste your own below for each match (comma‑separated players; bench after a slash '/'). Example: 'Maignan, Calabria, Thiaw, ... / Sportiello, Florenzi, Adli' ")
+st.info("Inserisci i nominativi: 'Titolari separati da virgole / Panchina separata da virgole'. Esempio: "
+        "Maignan, Calabria, Thiaw, ... / Sportiello, Florenzi, Adli")
 
 all_rows = []
-for _, row in sel_df.iterrows():
-    home, away = row.home, row.away
-    fixture_id = int(row.fixture_id)
-    ko_utc = pd.to_datetime(row["datetime"])  # already UTC
 
-    # Venue & weather
-    lat, lon = (None, None)
-    if row.venue_id:
-        lat, lon = get_venue_coords(int(row.venue_id))
-    wx = {}
-    if lat and lon:
-        try:
-            wx = get_weather(lat, lon, ko_utc.tz_localize("UTC") if ko_utc.tzinfo is None else ko_utc)
-        except Exception:
-            wx = {}
-
-    # Team stats
-    try:
-        home_stats = get_team_players_stats(int(row.home_id))
-        away_stats = get_team_players_stats(int(row.away_id))
-    except Exception as e:
-        st.warning(f"Stats fetch issue for {home} or {away}: {e}")
-        home_stats = pd.DataFrame()
-        away_stats = pd.DataFrame()
-
-    opp_home = get_team_defensive_tendencies(int(row.away_id))
-    opp_away = get_team_defensive_tendencies(int(row.home_id))
-
-    # Probabili formazioni from scraper (may be empty)
-    key = f"{home}|{away}"
-    pf = pf_map.get(key, {"home": [], "away": [], "bench_home": [], "bench_away": []})
-
+for label, fx in selected_ids.items():
+    home = fx["home"]; away = fx["away"]
+    ko_utc = fx["date_utc"]
+    st.markdown(f"### {home} (Casa)  vs  {away} (Trasferta)")
     col1, col2 = st.columns(2)
-    with col1:
-        st.markdown(f"### {home} (Casa)")
-        default_line = ", ".join(pf.get("home", [])) + " / " + ", ".join(pf.get("bench_home", [])) if pf else ""
-        inp_home = st.text_input(f"{home} titolari / panchina", key=f"home_{fixture_id}", value=default_line)
-        parts = [p.strip() for p in inp_home.split("/")]
-        home_line = [p.strip() for p in (parts[0].split(",") if parts and parts[0] else []) if p]
-        home_bench = [p.strip() for p in (parts[1].split(",") if len(parts) > 1 else []) if p]
-    with col2:
-        st.markdown(f"### {away} (Trasferta)")
-        default_line = ", ".join(pf.get("away", [])) + " / " + ", ".join(pf.get("bench_away", [])) if pf else ""
-        inp_away = st.text_input(f"{away} titolari / panchina", key=f"away_{fixture_id}", value=default_line)
-        parts = [p.strip() for p in inp_away.split("/")]
-        away_line = [p.strip() for p in (parts[0].split(",") if parts and parts[0] else []) if p]
-        away_bench = [p.strip() for p in (parts[1].split(",") if len(parts) > 1 else []) if p]
 
-    # Compute probabilities
-    if not home_stats.empty and (home_line or home_bench):
-        df_home = compute_probabilities(home_line, home_bench, home_stats, opp_home, wx)
-        df_home.insert(0, "team", home)
-        df_home.insert(0, "match", f"{home} vs {away}")
-        all_rows.append(df_home)
-    if not away_stats.empty and (away_line or away_bench):
-        df_away = compute_probabilities(away_line, away_bench, away_stats, opp_away, wx)
-        df_away.insert(0, "team", away)
-        df_away.insert(0, "match", f"{home} vs {away}")
-        all_rows.append(df_away)
-
-    # Weather card
+    # Meteo
+    wx = {}
+    if fx.get("venue_id"):
+        try:
+            lat, lon = venue_coords(int(fx["venue_id"]))
+            if lat and lon:
+                wx = open_meteo_at(float(lat), float(lon), ko_utc)
+        except:
+            wx = {}
     if wx:
-        st.caption(f"Meteo (vicino al calcio d'inizio): temp {wx.get('temperature_2m','?')}°C, precipitazioni {wx.get('precipitation','?')} mm, vento {wx.get('windspeed_10m','?')} km/h, nuvolosità {wx.get('cloudcover','?')}%")
+        st.caption(f"Meteo vicino al kickoff ({wx.get('time_local')}): "
+                   f"temp {wx.get('temperature_2m','?')}°C, pioggia {wx.get('precipitation','?')} mm, "
+                   f"vento {wx.get('windspeed_10m','?')} km/h, nuvole {wx.get('cloudcover','?')}%")
+
+    with col1:
+        inp_home = st.text_input(f"{home} — 'Titolari / Panchina'", key=f"home_{fx['fixture_id']}", value="")
+    with col2:
+        inp_away = st.text_input(f"{away} — 'Titolari / Panchina'", key=f"away_{fx['fixture_id']}", value="")
+
+    def parse_line(s: str) -> tuple[list[str], list[str]]:
+        if not s.strip():
+            return ([], [])
+        parts = s.split("/")
+        starters = [x.strip() for x in parts[0].split(",") if x.strip()]
+        bench = []
+        if len(parts) > 1:
+            bench = [x.strip() for x in parts[1].split(",") if x.strip()]
+        return (starters, bench)
+
+    home_line, home_bench = parse_line(inp_home)
+    away_line, away_bench = parse_line(inp_away)
+
+    # Stats squadre
+    try:
+        home_stats = team_players_stats(fx["home_id"])
+    except Exception as e:
+        home_stats = []
+    try:
+        away_stats = team_players_stats(fx["away_id"])
+    except Exception as e:
+        away_stats = []
+
+    opp_home = opponent_baseline_def(fx["away_id"])
+    opp_away = opponent_baseline_def(fx["home_id"])
+
+    if (home_line or home_bench) and home_stats:
+        rows_h = compute_for_squad(home_line, home_bench, home_stats, opp_home, wx, min_starter, min_bench)
+        for r in rows_h:
+            r["match"] = f"{home} vs {away}"
+            r["team"] = home
+        all_rows.extend(rows_h)
+
+    if (away_line or away_bench) and away_stats:
+        rows_a = compute_for_squad(away_line, away_bench, away_stats, opp_away, wx, min_starter, min_bench)
+        for r in rows_a:
+            r["match"] = f"{home} vs {away}"
+            r["team"] = away
+        all_rows.extend(rows_a)
 
 if not all_rows:
     st.stop()
 
-final = pd.concat(all_rows, ignore_index=True)
+# Ordinamenti
+rows_fouls = sorted(all_rows, key=lambda x: (x["P(≥2 fouls)"], x["starter"]), reverse=True)
+rows_sot   = sorted(all_rows, key=lambda x: (x["P(≥1 SOT)"],   x["starter"]), reverse=True)
 
-# Sort by probabilities
 tab1, tab2 = st.tabs(["Top: ≥2 falli", "Top: ≥1 tiro in porta"])
+
+def render_table(rows: list[dict], cols: list[str]):
+    show = [{c: r.get(c) for c in cols} for r in rows]
+    st.table(show)
+
 with tab1:
-    df1 = final.sort_values(["P(≥2 fouls)", "starter"], ascending=[False, False])
-    st.dataframe(df1[["match","team","player","starter","P(≥2 fouls)","lambda_fouls","exp_min"]], use_container_width=True)
+    render_table(rows_fouls, ["match","team","player","starter","P(≥2 fouls)","lambda_fouls","exp_min"])
+
 with tab2:
-    df2 = final.sort_values(["P(≥1 SOT)", "starter"], ascending=[False, False])
-    st.dataframe(df2[["match","team","player","starter","P(≥1 SOT)","lambda_sot","exp_min"]], use_container_width=True)
+    render_table(rows_sot, ["match","team","player","starter","P(≥1 SOT)","lambda_sot","exp_min"])
 
-st.download_button("Scarica CSV completo", final.to_csv(index=False).encode("utf-8"), file_name="seriea_probabilities.csv", mime="text/csv")
+# CSV download minimal
 
-st.caption("Model: Poisson for events per player per 90, adjusted by expected minutes, opponent tendencies (placeholders), and weather. Data quality depends on sources and naming alignment.")
+def to_csv(rows: list[dict]) -> str:
+    all_cols = ["match","team","player","starter","exp_min","lambda_fouls","lambda_sot","P(≥2 fouls)","P(≥1 SOT)"]
+    out = [",".join(all_cols)]
+    def esc(x): 
+        s = str(x)
+        return '"' + s.replace('"','""') + '"' if ("," in s or '"' in s or "
+" in s) else s
+    for r in rows:
+        out.append(",".join(esc(r.get(c,"")) for c in all_cols))
+    return "
+".join(out)
+
+csv_data = to_csv(all_rows).encode("utf-8")
+st.download_button("Scarica CSV completo", data=csv_data, file_name="seriea_probabilities.csv", mime="text/csv")
+
+st.caption("Modello: Poisson sugli eventi per 90', aggiustato per minuti attesi, tendenza avversario (placeholder) e meteo. "
+           "Inserisci con cura i nomi per migliorare l'aggancio alle statistiche dell'API.")
+
+# ================================
+# ISTRUZIONI (A PROVA DI BAMBINO)
+# ================================
+# 1) Hai già la chiave API dentro il file. Meglio ancora: puoi metterla nei Secrets come
+#      API_FOOTBALL_KEY = "605521ceda7756cc4cdb65f41e369e0d"
+#    e l'app userà quella al posto del fallback.
+# 2) Crea un repo su GitHub con questo unico file chiamato: streamlit_app.py
+# 3) Fai Deploy su Streamlit Cloud scegliendo:
+#      - Repository: il tuo
+#      - Branch: main
+#      - Main file path: streamlit_app.py
+# 4) Nell'app:
+#    - Lascia vuoto "Giornata" per prendere quella corrente.
+#    - Per ogni partita incolla i nomi: "Titolare1, Titolare2, ... / Panchina1, Panchina2, ..."
+#    - Guarda le 2 tabelle (≥2 falli, ≥1 tiro in porta) e, se vuoi, scarica il CSV.
