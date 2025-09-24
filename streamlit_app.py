@@ -2,46 +2,46 @@
 # Serie A Probabilities – 1-file app
 # Fouls ≥2  |  Shots on Target ≥1
 # ================================
-# Niente librerie extra: solo Python + Streamlit!
+# Nessuna libreria extra oltre a Streamlit:
 # - Dati partite/giocatori: API-FOOTBALL (serve API_FOOTBALL_KEY)
 # - Meteo stadio: Open-Meteo (gratis, no key)
-#
-# Come si usa: vedi istruzioni a fine file (sezione "ISTRUZIONI").
+# ISTRUZIONI semplici in fondo al file.
 # ================================
 
-import os, json, math, time
+import os, json, math
 from datetime import datetime, timezone, timedelta
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 import ssl
+import io, csv
 import streamlit as st
 
 # --------- CONFIG BASE ----------
 LEAGUE_ID = 135   # Serie A
 SEASON    = 2025  # Stagione 2025/26
 API_BASE  = "https://v3.football.api-sports.io"
-# Usa prima la variabile d'ambiente/Secrets; se manca, usa la tua chiave fornita
+
+# 1) L'app cerca prima nei Secrets/variabili d'ambiente
+# 2) Se non trova nulla, usa la tua chiave qui sotto come fallback
 API_KEY   = os.getenv("API_FOOTBALL_KEY", "605521ceda7756cc4cdb65f41e369e0d")
 
-# Disabilita verifiche SSL su alcuni ambienti (più tollerante)
+# Disabilita verifiche SSL su alcuni ambienti (tollerante)
 ssl_ctx = ssl.create_default_context()
 ssl_ctx.check_hostname = False
 ssl_ctx.verify_mode = ssl.CERT_NONE
 
 # ------------- UTILS ------------
 def http_get_json(url: str, headers: dict | None = None, params: dict | None = None) -> dict:
+    """GET HTTP → JSON (semplice, senza librerie esterne)"""
     if params:
         qs = urlencode({k: v for k, v in params.items() if v is not None})
-        if "?" in url:
-            url = url + "&" + qs
-        else:
-            url = url + "?" + qs
+        url = url + ("&" if "?" in url else "?") + qs
     req = Request(url, headers=headers or {})
     with urlopen(req, context=ssl_ctx, timeout=30) as resp:
         data = resp.read().decode("utf-8", errors="ignore")
     try:
         return json.loads(data)
-    except:
+    except Exception:
         return {}
 
 def api_get(path: str, params: dict) -> dict:
@@ -52,7 +52,6 @@ def api_get(path: str, params: dict) -> dict:
     return http_get_json(f"{API_BASE}/{path}", headers=headers, params=params)
 
 def parse_iso_utc(s: str) -> datetime:
-    # API restituisce ISO con Z oppure offset; normalizziamo
     # Esempi: "2025-09-27T18:45:00+00:00" oppure "2025-09-27T18:45:00Z"
     if s.endswith("Z"):
         s = s.replace("Z", "+00:00")
@@ -67,28 +66,29 @@ def fixtures_for_round(round_name: str) -> list[dict]:
     js = api_get("fixtures", {"league": LEAGUE_ID, "season": SEASON, "round": round_name})
     out = []
     for fx in js.get("response", []):
-        fixture = fx.get("fixture", {})
-        teams   = fx.get("teams", {})
-        venue   = fixture.get("venue", {})
+        fixture = fx.get("fixture", {}) or {}
+        teams   = fx.get("teams", {}) or {}
+        venue   = fixture.get("venue", {}) or {}
         out.append({
             "fixture_id": fixture.get("id"),
             "date_utc": parse_iso_utc(fixture.get("date")),
-            "status": fixture.get("status", {}).get("short"),
+            "status": (fixture.get("status") or {}).get("short"),
             "referee": fixture.get("referee"),
-            "home_id": teams.get("home", {}).get("id"),
-            "home":    teams.get("home", {}).get("name"),
-            "away_id": teams.get("away", {}).get("id"),
-            "away":    teams.get("away", {}).get("name"),
+            "home_id": (teams.get("home") or {}).get("id"),
+            "home":    (teams.get("home") or {}).get("name"),
+            "away_id": (teams.get("away") or {}).get("id"),
+            "away":    (teams.get("away") or {}).get("name"),
             "venue_id": venue.get("id"),
             "venue":   venue.get("name"),
             "city":    venue.get("city"),
         })
     return out
 
-def venue_coords(venue_id: int) -> tuple[float|None, float|None]:
+def venue_coords(venue_id: int) -> tuple[float | None, float | None]:
     js = api_get("venues", {"id": venue_id})
     resp = js.get("response", [])
-    if not resp: return (None, None)
+    if not resp:
+        return (None, None)
     v = resp[0]
     return (v.get("latitude"), v.get("longitude"))
 
@@ -105,19 +105,20 @@ def open_meteo_at(lat: float, lon: float, ko_utc: datetime) -> dict:
         "end_date": end,
     }
     js = http_get_json("https://api.open-meteo.com/v1/forecast", params=params)
-    hourly = js.get("hourly", {})
-    times = hourly.get("time", [])
-    if not times: return {}
-    # trova indice con tempo più vicino a ko_utc
-    best_i, best_diff = 0, 10**9
+    hourly = js.get("hourly", {}) or {}
+    times = hourly.get("time", []) or []
+    if not times:
+        return {}
+    # trova indice con tempo più vicino a ko_utc (conversione locale→UTC approssimata -2h)
+    best_i, best_diff = 0, 10**12
     for i, t in enumerate(times):
         try:
-            dt_local = datetime.fromisoformat(t)  # naive Europe/Rome
-            dt_utc = dt_local - timedelta(hours=2)  # approx offset
+            dt_local = datetime.fromisoformat(t)       # naive Europe/Rome
+            dt_utc = dt_local - timedelta(hours=2)     # offset approx (basta per ranking)
             diff = abs((dt_utc - ko_utc).total_seconds())
             if diff < best_diff:
                 best_diff, best_i = diff, i
-        except:
+        except Exception:
             pass
     def pick(key):
         arr = hourly.get(key, [])
@@ -131,13 +132,13 @@ def open_meteo_at(lat: float, lon: float, ko_utc: datetime) -> dict:
     }
 
 def team_players_stats(team_id: int) -> list[dict]:
-    # Stats per giocatore per 90: falli commessi, tiri in porta, minuti
+    """Statistiche per giocatore (Serie A): per90 SOT, per90 falli, minuti."""
     js = api_get("players", {"team": team_id, "season": SEASON, "league": LEAGUE_ID})
     out = []
-    for item in js.get("response", []):
-        player = item.get("player", {})
-        for stt in item.get("statistics", []):
-            if stt.get("league", {}).get("id") != LEAGUE_ID: 
+    for item in js.get("response", []) or []:
+        player = item.get("player", {}) or {}
+        for stt in item.get("statistics", []) or []:
+            if (stt.get("league") or {}).get("id") != LEAGUE_ID:
                 continue
             games = stt.get("games", {}) or {}
             shots = stt.get("shots", {}) or {}
@@ -157,26 +158,29 @@ def team_players_stats(team_id: int) -> list[dict]:
     return out
 
 def opponent_baseline_def(team_id: int) -> dict:
-    # placeholder medio (migliorabile in futuro)
+    # Placeholder medio (upgrade: calcolare ultime N partite)
     return {"opp_sot_allowed": 4.0, "opp_fouls_drawn": 12.0}
 
 def poisson_prob_ge_k(lam: float, k: int) -> float:
     lam = max(lam, 1e-9)
+    # P(X≥k) = 1 - sum_{i=0}^{k-1} e^-lam lam^i / i!
     s = 0.0
     for i in range(k):
         s += math.exp(-lam) * (lam**i) / math.factorial(i)
     return max(0.0, min(1.0, 1.0 - s))
 
 def weather_adjust(weather: dict) -> tuple[float, float]:
-    if not weather: return (1.0, 1.0)
+    """Ritorna (moltiplicatore_falli, moltiplicatore_SOT) in base al meteo."""
+    if not weather:
+        return (1.0, 1.0)
     precip = weather.get("precipitation") or 0.0
     wind   = weather.get("windspeed_10m") or 0.0
     temp   = weather.get("temperature_2m") or 18.0
     fouls_mult, sot_mult = 1.0, 1.0
-    if precip >= 1.0:    # pioggia ↑ falli, ↓ SOT
+    if precip >= 1.0:    # pioggia → +falli, -SOT
         fouls_mult *= 1.05
         sot_mult   *= 0.93
-    if wind >= 25:       # vento forte ↓ SOT
+    if wind >= 25:       # vento forte → -SOT
         sot_mult   *= 0.90
     if temp <= 5:
         fouls_mult *= 1.03
@@ -187,6 +191,7 @@ def weather_adjust(weather: dict) -> tuple[float, float]:
     return (fouls_mult, sot_mult)
 
 def best_name_match(name: str, stats: list[dict]) -> dict | None:
+    """Match esatto o sul cognome."""
     name_low = name.strip().lower()
     for r in stats:
         if (r.get("player") or "").strip().lower() == name_low:
@@ -236,13 +241,13 @@ min_bench   = st.sidebar.slider("Minuti attesi PANCHINA", 10, 45, 30, 5)
 
 round_in = st.sidebar.text_input("Giornata (lascia vuoto per auto)", value="")
 if not key_ok:
-    st.warning("Manca la chiave API_FOOTBALL_KEY. Vai in 'Manage app' → 'Secrets' e aggiungila (istruzioni sotto).")
+    st.warning("Manca la chiave API_FOOTBALL_KEY. Vai in 'Manage app' → 'Settings' → 'Secrets' e aggiungila (istruzioni sotto).")
 
-# Scopri la giornata
+# Scopri la giornata (se vuota)
 if not round_in:
     try:
         round_in = round_name_current()
-    except Exception as e:
+    except Exception:
         round_in = "Regular Season - 1"
 st.subheader(f"Giornata: {round_in}")
 
@@ -250,7 +255,7 @@ st.subheader(f"Giornata: {round_in}")
 fixtures = []
 try:
     fixtures = fixtures_for_round(round_in)
-except Exception as e:
+except Exception:
     st.error("Errore nel caricare le partite. Controlla la chiave API e riprova.")
 
 if not fixtures:
@@ -279,26 +284,27 @@ for label, fx in selected_ids.items():
             lat, lon = venue_coords(int(fx["venue_id"]))
             if lat and lon:
                 wx = open_meteo_at(float(lat), float(lon), ko_utc)
-        except:
+        except Exception:
             wx = {}
     if wx:
-        st.caption(f"Meteo vicino al kickoff ({wx.get('time_local')}): "
-                   f"temp {wx.get('temperature_2m','?')}°C, pioggia {wx.get('precipitation','?')} mm, "
-                   f"vento {wx.get('windspeed_10m','?')} km/h, nuvole {wx.get('cloudcover','?')}%")
+        st.caption(
+            f"Meteo vicino al kickoff ({wx.get('time_local')}): "
+            f"temp {wx.get('temperature_2m','?')}°C, pioggia {wx.get('precipitation','?')} mm, "
+            f"vento {wx.get('windspeed_10m','?')} km/h, nuvole {wx.get('cloudcover','?')}%"
+        )
 
     with col1:
         inp_home = st.text_input(f"{home} — 'Titolari / Panchina'", key=f"home_{fx['fixture_id']}", value="")
     with col2:
         inp_away = st.text_input(f"{away} — 'Titolari / Panchina'", key=f"away_{fx['fixture_id']}", value="")
 
+    # Parse input semplice
     def parse_line(s: str) -> tuple[list[str], list[str]]:
         if not s.strip():
             return ([], [])
         parts = s.split("/")
         starters = [x.strip() for x in parts[0].split(",") if x.strip()]
-        bench = []
-        if len(parts) > 1:
-            bench = [x.strip() for x in parts[1].split(",") if x.strip()]
+        bench = [x.strip() for x in parts[1].split(",") if x.strip()] if len(parts) > 1 else []
         return (starters, bench)
 
     home_line, home_bench = parse_line(inp_home)
@@ -307,11 +313,11 @@ for label, fx in selected_ids.items():
     # Stats squadre
     try:
         home_stats = team_players_stats(fx["home_id"])
-    except Exception as e:
+    except Exception:
         home_stats = []
     try:
         away_stats = team_players_stats(fx["away_id"])
-    except Exception as e:
+    except Exception:
         away_stats = []
 
     opp_home = opponent_baseline_def(fx["away_id"])
@@ -334,7 +340,7 @@ for label, fx in selected_ids.items():
 if not all_rows:
     st.stop()
 
-# Ordinamenti
+# Ordinamenti (nota: usiamo direttamente le chiavi unicode delle colonne)
 rows_fouls = sorted(all_rows, key=lambda x: (x["P(≥2 fouls)"], x["starter"]), reverse=True)
 rows_sot   = sorted(all_rows, key=lambda x: (x["P(≥1 SOT)"],   x["starter"]), reverse=True)
 
@@ -350,19 +356,15 @@ with tab1:
 with tab2:
     render_table(rows_sot, ["match","team","player","starter","P(≥1 SOT)","lambda_sot","exp_min"])
 
-# CSV download minimal
-
+# CSV download (robusto con csv.DictWriter)
 def to_csv(rows: list[dict]) -> str:
-    all_cols = ["match","team","player","starter","exp_min","lambda_fouls","lambda_sot","P(≥2 fouls)","P(≥1 SOT)"]
-    out = [",".join(all_cols)]
-    def esc(x): 
-        s = str(x)
-        return '"' + s.replace('"','""') + '"' if ("," in s or '"' in s or "
-" in s) else s
+    cols = ["match","team","player","starter","exp_min","lambda_fouls","lambda_sot","P(≥2 fouls)","P(≥1 SOT)"]
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+    w.writeheader()
     for r in rows:
-        out.append(",".join(esc(r.get(c,"")) for c in all_cols))
-    return "
-".join(out)
+        w.writerow(r)
+    return buf.getvalue()
 
 csv_data = to_csv(all_rows).encode("utf-8")
 st.download_button("Scarica CSV completo", data=csv_data, file_name="seriea_probabilities.csv", mime="text/csv")
@@ -373,15 +375,18 @@ st.caption("Modello: Poisson sugli eventi per 90', aggiustato per minuti attesi,
 # ================================
 # ISTRUZIONI (A PROVA DI BAMBINO)
 # ================================
-# 1) Hai già la chiave API dentro il file. Meglio ancora: puoi metterla nei Secrets come
+# 1) Vai su GitHub e crea un repo vuoto (es. 'falli-e-tiriiii').
+# 2) Crea un file chiamato esattamente: streamlit_app.py
+#    e INCOLLA tutto questo codice (tutto-tutto).
+#    Poi premi "Commit".
+# 3) Vai su Streamlit Cloud → New app → scegli il repo, branch 'main',
+#    main file 'streamlit_app.py' → Deploy.
+# 4) (Consigliato) In Manage app → Settings → Secrets incolla:
 #      API_FOOTBALL_KEY = "605521ceda7756cc4cdb65f41e369e0d"
-#    e l'app userà quella al posto del fallback.
-# 2) Crea un repo su GitHub con questo unico file chiamato: streamlit_app.py
-# 3) Fai Deploy su Streamlit Cloud scegliendo:
-#      - Repository: il tuo
-#      - Branch: main
-#      - Main file path: streamlit_app.py
-# 4) Nell'app:
-#    - Lascia vuoto "Giornata" per prendere quella corrente.
-#    - Per ogni partita incolla i nomi: "Titolare1, Titolare2, ... / Panchina1, Panchina2, ..."
-#    - Guarda le 2 tabelle (≥2 falli, ≥1 tiro in porta) e, se vuoi, scarica il CSV.
+#    Salva. (Se non lo fai, l'app usa comunque la chiave scritta nel file.)
+# 5) Apri l'app:
+#    - Lascia vuota "Giornata" (prende quella corrente).
+#    - Per ogni partita incolla i nomi così:
+#      Titolare1, Titolare2, ... , Titolare11 / Panchina1, Panchina2, ...
+#    - Vai nei tab: "Top: ≥2 falli" e "Top: ≥1 tiro in porta".
+#    - Se vuoi, scarica il CSV.
